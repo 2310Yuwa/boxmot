@@ -1,10 +1,13 @@
 # Mikel Broström 🔥 Yolo Tracking 🧾 AGPL-3.0 license
-
+import os
+import glob
 import argparse
 import cv2
 import numpy as np
+import ffmpeg
 from functools import partial
 from pathlib import Path
+import json
 
 import torch
 
@@ -54,6 +57,18 @@ def on_predict_start(predictor, persist=False):
 
     predictor.trackers = trackers
 
+def Create_Videowriter(w, h, output_path):
+    video_writer = (
+        ffmpeg
+        .input('pipe:', format='rawvideo', pix_fmt='rgb24', r=12, s='{}x{}'.format(w, h))
+        .output(output_path, pix_fmt='yuv420p')
+        .overwrite_output()
+        .run_async(pipe_stdin=True)
+    )
+    return video_writer
+
+def Delete_Videowriter(video_writer):
+    video_writer.stdin.close()
 
 @torch.no_grad()
 def run(args):
@@ -62,7 +77,7 @@ def run(args):
         args.imgsz = default_imgsz(args.yolo_model)
     yolo = YOLO(
         args.yolo_model if is_ultralytics_model(args.yolo_model)
-        else 'yolov8n.pt',
+        else 'yolov8n.pt'
     )
 
     results = yolo.track(
@@ -111,18 +126,122 @@ def run(args):
 
     # store custom args in predictor
     yolo.predictor.custom_args = args
+    
+    cam_homographies, area_info = load_camera_info(args.camera_info_dir)
+    
+    save_dir = os.path.join(args.project,
+                            os.path.basename(os.path.dirname(args.source)))
+    # save_vid_path = os.path.join(args.project, 
+    #                              os.path.basename(os.path.dirname(os.path.dirname(args.source))), 
+    #                              os.path.basename(os.path.dirname(args.source)) + '.mp4')
+    
+    if not os.path.isdir(save_dir):
+        os.makedirs(save_dir, exist_ok=True)
+    for frame_id, r in enumerate(results):
+        # if frame_id == 0:
+        #     img = r.plot()
+            # h, w = img.shape[:2]
+            # video_writer = Create_Videowriter(w, h, save_vid_path)
+        # video_writer.stdin.write(r.plot()[:, :, ::-1].tobytes())
+        
+        orig_img = r.orig_img
+        
+        if r.boxes and r.boxes.id is not None:
+            boxes = r.boxes.xyxy.cpu().numpy()
+            ids = r.boxes.id.int().cpu().tolist()
+            
+            
+            for id, box in zip(ids, boxes):
+                id = int(id)
+                x1, y1, x2, y2 = box.astype(int)
+                
+                center = calc_center(x1, y1, x2, y2, cam_homographies)
+                area = which_area(center, area_info)
+                
+                if area in [8, 9, 10, 18]:
+                    # save_txt_path = os.path.join(save_dir, "track.txt")
+                    if not os.path.isdir(os.path.join(save_dir, "area" + str(area), "person" + str(id), "crops")):
+                        os.makedirs(os.path.join(save_dir, "area" + str(area), "person" + str(id), "crops"), exist_ok=True)
+                    if area == 8 and (x1 + x2)/2 >= 1280 / 2:
+                        save_txt_path = os.path.join(save_dir, "area" + str(area), "person" + str(id), "track.txt")
+                        if not os.path.isfile(save_txt_path):
+                            with open(save_txt_path, 'w') as f:
+                                f.write(f'{frame_id+1} {id} {area} {x1} {y1} {x2-x1} {y2-y1}\n')
+                        else:
+                            with open(save_txt_path, 'a') as f:
+                                f.write(f'{frame_id+1} {id} {area} {x1} {y1} {x2-x1} {y2-y1}\n')
+                                
+                        image_crop = orig_img[y1:y2, x1:x2]
+                        cv2.imwrite(os.path.join(save_dir, "area" + str(area), "person" + str(id), "crops", "{}.jpg".format(frame_id)), image_crop)
+                    elif area == 10 and (x1 + x2)/2 < 1280 / 2:
+                        save_txt_path = os.path.join(save_dir, "area" + str(area), "person" + str(id), "track.txt")
+                        if not os.path.isfile(save_txt_path):
+                            with open(save_txt_path, 'w') as f:
+                                f.write(f'{frame_id+1} {id} {area} {x1} {y1} {x2-x1} {y2-y1}\n')
+                        else:
+                            with open(save_txt_path, 'a') as f:
+                                f.write(f'{frame_id+1} {id} {area} {x1} {y1} {x2-x1} {y2-y1}\n')
+                                
+                        image_crop = orig_img[y1:y2, x1:x2]
+                        cv2.imwrite(os.path.join(save_dir, "area" + str(area), "person" + str(id), "crops", "{}.jpg".format(frame_id)), image_crop)
+                        
+                
+        # img = yolo.predictor.trackers[0].plot_results(r.orig_img, args.show_trajectories)
+        # if hasattr(yolo.predictor.trackers[0], 'plot_results'):
+        #     img = yolo.predictor.trackers[0].plot_results(r.orig_img, args.show_trajectories)
+        # else:
+        #     print("Tracker does not support plot_results, skipping visualization.")
+        #     img = r.orig_img  # Pass the original image without annotations
+        
 
-    for r in results:
-
-        img = yolo.predictor.trackers[0].plot_results(r.orig_img, args.show_trajectories)
 
         if args.show is True:
             cv2.imshow('BoxMOT', img)     
             key = cv2.waitKey(1) & 0xFF
             if key == ord(' ') or key == ord('q'):
                 break
+            
+    # Delete_Videowriter(video_writer)
 
+def load_camera_info(info_dir):
+    cam_info_path = glob.glob(os.path.join(info_dir, "CameraInfo", "*.json"))
+    cam_homographies = {}
+    for path in cam_info_path:
+        cam_id = os.path.basename(path).split(".")[0]
+        with open(path, "r") as f:
+            cam_info = json.load(f)
+            homography_inv = np.linalg.inv(cam_info.get("homography matrix"))
+            cam_homographies[cam_id] = homography_inv
+    
+    area_info_path = os.path.join(info_dir, "AreaInfo", "area_info.json")
+    with open(area_info_path, "r") as f:
+        area_info = json.load(f)
+    return cam_homographies, area_info
 
+def calc_center(xmin, ymin, xmax, ymax, cam_homographies):
+    if (xmin + xmax) / 2 < 1280 / 2:
+        cam_id = "c0"
+        center = np.array([(xmin + xmax) / 2, 
+                            (ymin + ymax) / 2,
+                            1])
+    else:
+        cam_id = "c1"
+        center = np.array([(xmin + xmax) / 2 - 1280 / 2, 
+                            (ymin + ymax) / 2,
+                            1])
+    center = cam_homographies[cam_id] @ center
+    center = center / center[2]
+    center = center[:2]
+    return center
+
+def which_area(center, area_info):
+    for id, area in area_info.items():
+        area = np.array(area)
+        if center[0] >= area[0] and center[0] < area[2] and center[1] >= area[1] and center[1] < area[3]:
+            return int(id)
+    return -1
+
+    
 def parse_opt():
     
     parser = argparse.ArgumentParser()
@@ -136,7 +255,7 @@ def parse_opt():
                         help='file/dir/URL/glob, 0 for webcam')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=None,
                         help='inference size h,w')
-    parser.add_argument('--conf', type=float, default=0.5,
+    parser.add_argument('--conf', type=float, default=0.4,
                         help='confidence threshold')
     parser.add_argument('--iou', type=float, default=0.7,
                         help='intersection over union (IoU) threshold for NMS')
@@ -177,6 +296,7 @@ def parse_opt():
                         help='print results per frame')
     parser.add_argument('--agnostic-nms', default=False, action='store_true',
                         help='class-agnostic NMS')
+    parser.add_argument('--camera-info-dir', type=str, default=None)
 
     opt = parser.parse_args()
     return opt
